@@ -1,0 +1,280 @@
+from rockset import *
+from rockset.models import *
+import time
+import json
+import os
+
+# Initialize the client
+# Set the API Key as an environmental variable in the shell via:
+# export ROCKET_API_KEY='<insert key here>'
+rocksetApiKey = os.getenv("ROCKSET_API_KEY")
+apiServerHost = Regions.usw2a1 #ex: Regions.usw2a1
+
+# You do not need to create these. These will be created for you
+workspaceName = "steam_data"
+collectionName = "steam_product_listings"
+
+# Parameters to create our Scheduled Query Lambda with an automated email report using SendGrid
+queryLambdaName = "steamProductListingsReport"
+webhookAuthorization = "Bearer YOUR_SENDGRID_API_KEY"
+webhookURL = "https://api.sendgrid.com/v3/mail/send"
+senderEmail = "SENDER_EMAIL"
+senderName = "SENDER_NAME"
+receivingEmail = "RECEIVING_EMAIL"
+receivingName = "RECEIVING_NAME"
+pastDays = "2555" # Number of past days (7 years) since current date to get product listings from.
+gamePrice = "1.99"
+subjectLine = "Automated e-mail - Total Products Listed"
+emailContent = "Total products from last 7 years to date listed with price greater than "+gamePrice+": {{QUERY_RESULTS}}" # Content of automated email. Uses special character sequence {{QUERY RESULTS}} which returns the result of the query.
+cronSchedule = "0 16 * * *" # UNIX cron format for every day at 16 UTC.
+numberOfExecutions = 1 # Can change to `None` for unlimited number of executions.
+
+rs = RocksetClient(host=apiServerHost, api_key=rocksetApiKey)
+
+def create_workspace(rs, workspaceName):
+    try:
+        print(f"Creating workspace `{workspaceName}`...")
+        api_response = rs.Workspaces.create(
+            name=workspaceName,
+        )
+        print(f"Workspace `{workspaceName}` created!")
+    except ApiException as e:
+        print("Exception when creating workspace: %s\n" % json.loads(e.body))
+    
+def create_collection(rs, workspaceName, collectionName):
+    ingest_transformation_query= """
+    SELECT
+        CAST(release_date as DATE) AS release_date, 
+        CAST(price as FLOAT) AS price, 
+        _input.*
+    EXCEPT
+        (_meta, 
+        release_date, 
+        price)
+    FROM
+        _input
+    """
+    
+    try:
+        print(f"Creating collection `{collectionName}`...")
+        api_response = rs.Collections.create_s3_collection(
+            field_mapping_query=FieldMappingQuery(
+                sql=ingest_transformation_query,
+            ),
+            name=collectionName,
+            workspace=workspaceName,
+            sources=[
+                S3SourceWrapper(
+                    bucket="s3://rockset-community-datasets",
+                    prefix="public/steam-games-reviews/steam_games.json",
+                    region="us-west-2"
+                ),
+            ]
+        )
+        print(f"Collection `{collectionName}` created!")
+    except ApiException as e:
+        print("Exception when creating collection: %s\n" % json.loads(e.body))
+
+def wait_for_collection_ready(rs, workspaceName, collectionName, max_attempts=30):
+    print(f"Waiting for the `{collectionName}` collection to be `Ready` (~5 minutes)...")
+    for attempt in range(max_attempts):
+        api_response = rs.Collections.get(collection=collectionName, workspace=workspaceName)
+
+        if api_response.data.status == "READY":
+            print(f"Collection `{collectionName}` ready!")
+            break
+        else:
+            time.sleep(60)
+            
+    print("Collection still not ready. Check collection status in console.")
+
+def create_query_lambda(rs, workspaceName, collectionName, queryLambdaName):
+    description = "get number of product listings greater than a certain price created at or after the specified date"
+    query = f"""
+    SELECT
+        COUNT(*) AS number_products_listed
+    FROM
+        {workspaceName}.{collectionName}
+    WHERE
+        release_date >= CURRENT_DATE() - DAYS(:past_days)
+        AND price > :game_price;
+    """
+
+    try:
+        print(f"Creating query lambda `{queryLambdaName}`...")
+        api_response = rs.QueryLambdas.create_query_lambda(
+            name=queryLambdaName,
+            workspace=workspaceName,
+            sql=QueryLambdaSql(
+                default_parameters=[
+                    QueryParameter(
+                        name="past_days",
+                        type="int",
+                        value=pastDays
+                    ), 
+                    QueryParameter(
+                        name="game_price",
+                        type="float",
+                        value=gamePrice
+                    )
+                ],
+                query=query,
+            ),
+        )
+        print(f"Query lambda `{queryLambdaName}` created!")
+    except ApiException as e:
+        print(f"Exception when creating query lambda: %s\n" % json.loads(e.body))
+    
+def created_scheduled_ql(rs, workspaceName, queryLambdaName, cronSchedule, webhookURL, webhookAuthorization, numberOfExecutions):
+
+    # Webhook payload for the SendGrid email.
+    payload_content = """
+        {\"personalizations\": 
+        [ {      
+        \"to\": [{          
+            \"email\": \""""+receivingEmail+"""\",         
+            \"name\": \""""+receivingName+"""\"       
+        }],     
+        \"subject\": \""""+subjectLine+"""\"    
+        }],
+        \"content\": [{     
+            \"type\": \"text/plain\",     
+             \"value\": \""""+emailContent+"""\"
+        }], 
+        \"from\": {   
+            \"email\": \""""+senderEmail+"""\",   
+            \"name\": \""""+senderName+"""\" 
+        }, 
+        \"reply_to\": {    
+            \"email\": \""""+senderEmail+"""\",    
+            \"name\": \""""+senderName+"""\"
+        }}
+        """
+
+    try:
+        print(f"Creating scheduled query lambda for `{queryLambdaName}`...")
+        api_response=rs.ScheduledLambdas.create(
+            apikey=rocksetApiKey,
+            cron_string=cronSchedule,
+            ql_name=queryLambdaName,
+            tag="latest",
+            total_times_to_execute=numberOfExecutions,
+            webhook_auth_header=webhookAuthorization,
+            webhook_payload=payload_content,
+            webhook_url=webhookURL,
+            workspace=workspaceName
+        )
+        print(f"Scheduled query lambda for `{queryLambdaName}` created!")
+    except ApiException as e:
+        print(f"Exception when creating scheduled query lambda: %s\n" % json.loads(e.body))
+      
+# Returns the Scheduled QL rrn 
+def get_scheduled_ql_rrn(rs, scheduledLambdaName, tag="latest"):
+    try:
+        api_response = rs.ScheduledLambdas.list_org_scheduled_lambdas(
+        )
+        schedules = api_response.data
+        for schedule in schedules:
+            if schedule.get("ql_name") == scheduledLambdaName:
+                return schedule.get("rrn")
+    except ApiException as e:
+        print("Exception when getting rnn for Scheduled Query Lambda: %s\n" % json.loads(e.body))
+        return None
+
+def clean_up_demo(rs, workspaceName, collectionName, queryLambdaName, scheduledQLrrn, max_attempts=10):
+
+  	# Deleting Schedule
+    try:
+      print(f"Deleting schedule `{scheduledQLrrn}`...")
+            api_response = rs.ScheduledLambdas.delete(
+              scheduled_lambda_id=scheduledQLrrn,
+            )
+        # Checking if Schedule is deleted
+        for attempt in range(max_attempts):
+          try:
+            api_response = rs.ScheduledLambdas.get(
+              scheduled_lambda_id=scheduledQLrrn
+            )
+         	except ApiException as e:
+             if json.loads(e.body).get("message_key") == "SCHEDULED_LAMBDA_NOT_FOUND": 
+               	print(f"Schedule `{scheduledQLrrn}` deleted.")
+                break
+          time.sleep(30)
+      except ApiException as e:
+            print(f"Exception when deleting schedule: %s\n" % json.loads(e.body))
+  
+    # Deleting Query Lambda
+    try:
+        print(f"Deleting Query Lambda `{queryLambdaName}`...")
+        api_response = rs.QueryLambdas.delete_query_lambda(
+            query_lambda=queryLambdaName, 
+            workspace=workspaceName
+        )
+        # Checking if Query Lambda is deleted
+        for attempt in range(max_attempts):
+            try:
+                api_response = rs.QueryLambdas.get_query_lambda_tag_version(
+                    query_lambda=queryLambdaName, 
+                    workspace=workspaceName, 
+                    tag="latest"
+                )
+            except ApiException as e:
+                if json.loads(e.body).get("message_key") == "QUERY_NOT_FOUND": 
+                    print(f"Query Lambda `{queryLambdaName}` deleted.")
+                    break
+            time.sleep(30)   
+    except ApiException as e:
+        print(f"Exception when deleting Query Lambda: %s\n" % json.loads(e.body))
+
+    # Deleting Collection
+    try:
+        print(f"Deleting Collection `{collectionName}`...")
+        api_response = rs.Collections.delete(
+            collection=collectionName, 
+            workspace=workspaceName
+        )
+        # Checking if Collection is deleted
+        for attempt in range(max_attempts):
+            try:
+                api_response = rs.Collections.get(
+                    collection=collectionName, 
+                    workspace=workspaceName
+                )
+            except ApiException as e:
+                if json.loads(e.body).get("message_key") == "COLLECTION_DOES_NOT_EXIST": 
+                    print(f"Collection `{collectionName}` deleted.")
+                    break
+            time.sleep(30)
+    except ApiException as e:
+        print(f"Exception when deleting Collection: %s\n" % json.loads(e.body))
+
+    # Deleting Workspace
+    try:
+        print(f"Deleting workspace `{workspaceName}`...")
+        api_response = rs.Workspaces.delete(
+            workspace=workspaceName
+        )
+        # Checking if Workspace is deleted
+        for attempt in range(max_attempts):
+            try:
+                api_response = rs.Workspaces.get(
+                    workspace=workspaceName
+                )
+            except ApiException as e:
+                if json.loads(e.body).get("message_key") == "WORKSPACE_NOT_FOUND": 
+                    print(f"Workspaces `{workspaceName}` deleted.")
+                    break
+            time.sleep(30)
+    except ApiException as e:
+        print(f"Exception when deleting workspace: %s\n" % json.loads(e.body))
+
+# Excecute once
+create_workspace(rs, workspaceName)    
+create_collection(rs, workspaceName, collectionName)
+wait_for_collection_ready(rs, workspaceName, collectionName)
+create_query_lambda(rs, workspaceName, collectionName, queryLambdaName)
+created_scheduled_ql(rs, workspaceName, queryLambdaName, cronSchedule, webhookURL, webhookAuthorization, numberOfExecutions)
+
+# Leave `scheduledQLrrn` line uncommented and uncomment below to delete the workspace, collection, schedules, and QLs that were created
+#scheduledQLrrn = get_scheduled_ql_rrn(rs, queryLambdaName)
+#clean_up_demo(rs, workspaceName, collectionName, queryLambdaName, scheduledQLrrn)
