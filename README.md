@@ -9,8 +9,8 @@ You can copy the full Pythons script without step-by-step descriptions via the a
 Link to Recipe on Rockset Website: https://docs.rockset.com/documentation/recipes/send-automated-email-reports
 
 ## **Requirements**
-Python >= 3.6
-pip install rockset time json os
+- Python >= 3.6
+- `pip install rockset time json os`
 
 *_The things you have to change to successfully run this script are **rocksetApiKey**, **apiServerHost**, **webhookAuthorization**, **senderEmail**, **senderName**, **receivingEmail**, and **receivingName**_.
 
