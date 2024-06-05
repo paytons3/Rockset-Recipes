@@ -32,7 +32,6 @@ rs = RocksetClient(host=apiServerHost, api_key=rocksetApiKey)
 Here we will define the parameters that will be included in our [Scheduled Query Lambda](https://docs.rockset.com/documentation/docs/query-lambdas#scheduled-query-lambdas). We will be using SendGrid to create this email automation, so be sure to [set up a SendGrid account and API key](https://docs.sendgrid.com/for-developers/sending-email/api-getting-started).
 
 ```
-# Parameters to create our Scheduled Query Lambda with an automated email report using SendGrid
 queryLambdaName = "steamProductListingsReport"
 webhookAuthorization = "Bearer YOUR_SENDGRID_API_KEY"
 webhookURL = "https://api.sendgrid.com/v3/mail/send"
